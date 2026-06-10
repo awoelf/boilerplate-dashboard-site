@@ -1,507 +1,39 @@
-# ============================================================
-# requirements.txt
-# ============================================================
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-pydantic==2.10.4
-pydantic-settings==2.7.0
-python-dotenv==1.0.1
+"""
+Database layer using Python's built-in sqlite3 + boto3 for AWS S3.
 
+How it works
+────────────
+Dev  (USE_S3=false): connects directly to the local DB_PATH file.
+Prod (USE_S3=true):  downloads the .db file from S3 into DB_PATH on
+                     startup, then connects to that local copy.
+                     The file is re-downloaded each time the server starts,
+                     so deployments always get the latest snapshot from S3.
 
-# ============================================================
-# .env.example  (copy to .env)
-# ============================================================
-ENV=dev
-API_TITLE=My Data API
-API_VERSION=1.0.0
-API_PASSWORD=changeme
-DB_PATH=./app.db
-CORS_ORIGINS=["*"]
-SHOW_DOCS=true
-DEFAULT_PAGE_SIZE=100
-MAX_PAGE_SIZE=1000
-HOST=0.0.0.0
-PORT=5000
-
-
-# ============================================================
-# config.py
-# ============================================================
-from typing import List
-from pydantic_settings import BaseSettings
-from pydantic import field_validator
-
-
-class Settings(BaseSettings):
-    ENV: str = "dev"
-    API_TITLE: str = "Data API"
-    API_DESCRIPTION: str = "Read-only data API with filtering and search capabilities."
-    API_VERSION: str = "1.0.0"
-    API_PREFIX: str = "/api"
-    API_PASSWORD: str = "changeme"
-    DB_PATH: str = "./app.db"
-    HOST: str = "0.0.0.0"
-    PORT: int = 5000
-    CORS_ORIGINS: List[str] = ["*"]
-    SHOW_DOCS: bool = True
-    DEFAULT_PAGE_SIZE: int = 100
-    MAX_PAGE_SIZE: int = 1000
-
-    @field_validator("ENV")
-    @classmethod
-    def validate_env(cls, v: str) -> str:
-        if v not in ("dev", "prod"):
-            raise ValueError("ENV must be 'dev' or 'prod'")
-        return v
-
-    @property
-    def is_dev(self) -> bool:
-        return self.ENV == "dev"
-
-    @property
-    def is_prod(self) -> bool:
-        return self.ENV == "prod"
-
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
-
-
-settings = Settings()
-
-
-# ============================================================
-# database.py
-# ============================================================
-import sqlite3
-from config import settings
-
-
-def _connect(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
-
-
-def get_connection(db_key: str = "default") -> sqlite3.Connection:
-    path = DB_REGISTRY[db_key]
-    return _connect(path)
-
-
-DB_REGISTRY: dict[str, str] = {
-    "default": settings.DB_PATH,
-    # "analytics": settings.DB_PATH_ANALYTICS,
-}
-
-
-# ============================================================
-# models.py
-# ============================================================
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS categories (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT    NOT NULL,
-    slug        TEXT    NOT NULL UNIQUE,
-    description TEXT,
-    parent_id   INTEGER REFERENCES categories(id),
-    created_at  TEXT    DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS customers (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    name         TEXT NOT NULL,
-    email        TEXT UNIQUE,
-    phone        TEXT,
-    city         TEXT,
-    country      TEXT,
-    country_code TEXT,
-    created_at   TEXT DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS products (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    name        TEXT    NOT NULL,
-    description TEXT,
-    sku         TEXT    UNIQUE,
-    category_id INTEGER REFERENCES categories(id),
-    price       REAL    NOT NULL DEFAULT 0,
-    stock_qty   INTEGER NOT NULL DEFAULT 0,
-    active      INTEGER NOT NULL DEFAULT 1,
-    created_at  TEXT    DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS orders (
-    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-    customer_id  INTEGER REFERENCES customers(id),
-    status       TEXT NOT NULL DEFAULT 'pending',
-    total_amount REAL NOT NULL DEFAULT 0,
-    currency     TEXT NOT NULL DEFAULT 'USD',
-    notes        TEXT,
-    created_at   TEXT DEFAULT (datetime('now')),
-    updated_at   TEXT DEFAULT (datetime('now'))
-);
-
-CREATE TABLE IF NOT EXISTS order_items (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_id   INTEGER NOT NULL REFERENCES orders(id),
-    product_id INTEGER REFERENCES products(id),
-    quantity   INTEGER NOT NULL DEFAULT 1,
-    unit_price REAL    NOT NULL,
-    subtotal   REAL    NOT NULL,
-    created_at TEXT    DEFAULT (datetime('now'))
-);
+Adding a second database
+─────────────────────────
+1. Add S3_BUCKET_<NAME> / S3_KEY_<NAME> / DB_PATH_<NAME> vars to config.py.
+2. Call download_db_from_s3() for it in main.py lifespan.
+3. Register it in DB_REGISTRY below.
+4. Reference it via "db" in registry.py.
 """
 
 
-# ============================================================
-# schemas.py
-# ============================================================
-from __future__ import annotations
-from typing import Generic, List, TypeVar
-from pydantic import BaseModel
+"""
+Entry point.
 
-T = TypeVar("T")
-
-
-class Page(BaseModel, Generic[T]):
-    total: int
-    page: int
-    page_size: int
-    pages: int
-    items: List[T]
-
-
-class TableMeta(BaseModel):
-    name: str
-    db: str
-    row_count: int
-    columns: List[str]
-    searchable_columns: List[str]
-
-
-# ============================================================
-# registry.py
-# ============================================================
-from typing import Any, Dict
-
-TABLE_REGISTRY: Dict[str, Dict[str, Any]] = {
-    "categories": {
-        "db": "default",
-        "searchable_cols": ["name", "slug", "description"],
-        "filterable_cols": ["id", "name", "slug", "parent_id"],
-        "default_sort": "id",
-    },
-    "customers": {
-        "db": "default",
-        "searchable_cols": ["name", "email", "city", "country"],
-        "filterable_cols": ["id", "name", "email", "city", "country", "country_code"],
-        "default_sort": "id",
-    },
-    "products": {
-        "db": "default",
-        "searchable_cols": ["name", "description", "sku"],
-        "filterable_cols": ["id", "name", "sku", "category_id", "active"],
-        "default_sort": "id",
-    },
-    "orders": {
-        "db": "default",
-        "searchable_cols": ["status", "currency", "notes"],
-        "filterable_cols": ["id", "customer_id", "status", "currency"],
-        "default_sort": "id",
-    },
-    "order_items": {
-        "db": "default",
-        "searchable_cols": [],
-        "filterable_cols": ["id", "order_id", "product_id"],
-        "default_sort": "id",
-    },
-}
-
-
-def get_table_entry(table_name: str) -> Dict[str, Any]:
-    if table_name not in TABLE_REGISTRY:
-        raise KeyError(f"Unknown table: '{table_name}'")
-    return TABLE_REGISTRY[table_name]
-
-
-# ============================================================
-# auth.py
-# ============================================================
-from fastapi import HTTPException, Security, status
-from fastapi.security import APIKeyHeader, APIKeyQuery
-from config import settings
-
-_header_scheme = APIKeyHeader(name="X-API-Key", auto_error=False)
-_query_scheme = APIKeyQuery(name="api_key", auto_error=False)
-
-
-async def require_api_key(
-    header_key: str = Security(_header_scheme),
-    query_key: str = Security(_query_scheme),
-) -> str:
-    key = header_key or query_key
-    if not key or key != settings.API_PASSWORD:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing API key.",
-            headers={"WWW-Authenticate": "ApiKey"},
-        )
-    return key
-
-
-# ============================================================
-# routers/__init__.py
-# ============================================================
-from .data import router
-
-
-# ============================================================
-# routers/data.py
-# ============================================================
-from __future__ import annotations
-import math
-import sqlite3
-from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from auth import require_api_key
-from config import settings
-from database import get_connection
-from registry import TABLE_REGISTRY, get_table_entry
-
-router = APIRouter(prefix="", tags=["data"], dependencies=[Depends(require_api_key)])
-
-
-def _row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
-    return dict(row)
-
-
-def _get_columns(conn: sqlite3.Connection, table: str) -> List[str]:
-    cur = conn.execute(f"PRAGMA table_info({table})")
-    return [r["name"] for r in cur.fetchall()]
-
-
-def _count(conn: sqlite3.Connection, table: str, where: str, params: list) -> int:
-    sql = f"SELECT COUNT(*) as n FROM {table}"
-    if where:
-        sql += f" WHERE {where}"
-    row = conn.execute(sql, params).fetchone()
-    return row["n"] if row else 0
-
-
-def _build_where(entry, filters, search):
-    conditions: List[str] = []
-    params: List[Any] = []
-    if search:
-        searchable = entry.get("searchable_cols", [])
-        if searchable:
-            like_parts = [f"LOWER(CAST({c} AS TEXT)) LIKE ?" for c in searchable]
-            conditions.append(f"({' OR '.join(like_parts)})")
-            params.extend([f"%{search.lower()}%"] * len(searchable))
-    for col, val in filters.items():
-        if col in entry.get("filterable_cols", []):
-            conditions.append(f"{col} = ?")
-            params.append(val)
-    return " AND ".join(conditions), params
-
-
-def _query_page(conn, table, where, params, sort, page, page_size):
-    total = _count(conn, table, where, params)
-    pages = math.ceil(total / page_size) if page_size else 1
-    offset = (page - 1) * page_size
-    sql = f"SELECT * FROM {table}"
-    if where:
-        sql += f" WHERE {where}"
-    sql += f" ORDER BY {sort} LIMIT ? OFFSET ?"
-    rows = conn.execute(sql, params + [page_size, offset]).fetchall()
-    return total, pages, [_row_to_dict(r) for r in rows]
-
-
-@router.get("/tables", summary="List available tables")
-def list_tables():
-    result = []
-    for name, entry in TABLE_REGISTRY.items():
-        db_key = entry.get("db", "default")
-        conn = get_connection(db_key)
-        try:
-            columns = _get_columns(conn, name)
-            count = _count(conn, name, "", [])
-        finally:
-            conn.close()
-        result.append({
-            "name": name, "db": db_key, "row_count": count,
-            "columns": columns, "searchable_columns": entry.get("searchable_cols", []),
-        })
-    return result
-
-
-@router.get("/{table}", summary="Get all rows from a table")
-def get_table(
-    table: str,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(settings.DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE),
-    request: Request = None,
-):
-    try:
-        entry = get_table_entry(table)
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Table '{table}' not found.")
-    filters = {k: v for k, v in (request.query_params.items() if request else {})
-               if k in entry.get("filterable_cols", [])}
-    conn = get_connection(entry.get("db", "default"))
-    try:
-        where, params = _build_where(entry, filters, None)
-        total, pages, items = _query_page(conn, table, where, params, entry.get("default_sort", "id"), page, page_size)
-    finally:
-        conn.close()
-    return {"total": total, "page": page, "page_size": page_size, "pages": pages, "items": items}
-
-
-@router.get("/{table}/search", summary="Search / filter a table")
-def search_table(
-    table: str,
-    q: Optional[str] = Query(None),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(settings.DEFAULT_PAGE_SIZE, ge=1, le=settings.MAX_PAGE_SIZE),
-    request: Request = None,
-):
-    try:
-        entry = get_table_entry(table)
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Table '{table}' not found.")
-    filters = {k: v for k, v in (request.query_params.items() if request else {})
-               if k in entry.get("filterable_cols", []) and k != "q"}
-    conn = get_connection(entry.get("db", "default"))
-    try:
-        where, params = _build_where(entry, filters, q)
-        total, pages, items = _query_page(conn, table, where, params, entry.get("default_sort", "id"), page, page_size)
-    finally:
-        conn.close()
-    return {"total": total, "page": page, "page_size": page_size, "pages": pages, "items": items}
-
-
-@router.get("/{table}/{id}", summary="Get a single row by ID")
-def get_row(table: str, id: int):
-    try:
-        entry = get_table_entry(table)
-    except KeyError:
-        raise HTTPException(status_code=404, detail=f"Table '{table}' not found.")
-    conn = get_connection(entry.get("db", "default"))
-    try:
-        row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", [id]).fetchone()
-    finally:
-        conn.close()
-    if row is None:
-        raise HTTPException(status_code=404, detail=f"Row {id} not found in '{table}'.")
-    return _row_to_dict(row)
-
-
-# ============================================================
-# seed.py
-# ============================================================
-import argparse
-import random
-from datetime import datetime, timedelta
-from database import get_connection
-from models import SCHEMA_SQL
-
-CATEGORIES = [
-    ("Electronics", "electronics", "Gadgets and devices"),
-    ("Clothing",    "clothing",    "Apparel and accessories"),
-    ("Books",       "books",       "Print and digital books"),
-    ("Home & Garden","home-garden","Furniture, decor, tools"),
-    ("Sports",      "sports",      "Sporting goods and fitness"),
-]
-CUSTOMERS = [
-    ("Alice Johnson","alice@example.com", "+1-555-0101","New York",    "United States","US"),
-    ("Bob Smith",    "bob@example.com",   "+1-555-0102","Los Angeles", "United States","US"),
-    ("Clara Müller", "clara@example.de",  "+49-30-1234","Berlin",      "Germany",      "DE"),
-    ("David Okafor", "david@example.ng",  "+234-1-000", "Lagos",       "Nigeria",      "NG"),
-    ("Emilia Rossi", "emilia@example.it", "+39-06-5678","Rome",        "Italy",        "IT"),
-    ("Frank Tanaka", "frank@example.jp",  "+81-3-1111", "Tokyo",       "Japan",        "JP"),
-    ("Grace Kim",    "grace@example.kr",  "+82-2-2222", "Seoul",       "South Korea",  "KR"),
-    ("Hector Garcia","hector@example.mx", "+52-55-3333","Mexico City", "Mexico",       "MX"),
-    ("Iris Dupont",  "iris@example.fr",   "+33-1-4444", "Paris",       "France",       "FR"),
-    ("James Chen",   "james@example.cn",  "+86-10-5555","Shanghai",    "China",        "CN"),
-]
-PRODUCTS = [
-    ("Wireless Earbuds Pro",    "SKU-ELEC-001", 0, 89.99,  150),
-    ('4K Smart TV 55"',         "SKU-ELEC-002", 0, 649.00,  40),
-    ("USB-C Charging Hub",      "SKU-ELEC-003", 0, 34.99,  300),
-    ("Running Shoes",           "SKU-CLTH-001", 1, 79.95,  200),
-    ("Yoga Mat",                "SKU-SPRT-001", 4, 29.99,  180),
-    ("Python for Beginners",    "SKU-BOOK-001", 2, 24.99,  500),
-    ("The Art of Design",       "SKU-BOOK-002", 2, 39.99,  220),
-    ("Garden Hose 50ft",        "SKU-HOME-001", 3, 44.50,   90),
-    ("Standing Desk Converter", "SKU-HOME-002", 3, 149.00,  60),
-    ("Resistance Bands Set",    "SKU-SPRT-002", 4, 19.99,  400),
-]
-STATUSES = ["pending", "confirmed", "shipped", "delivered", "cancelled"]
-
-
-def seed(clear: bool = False):
-    conn = get_connection("default")
-    if clear:
-        for t in ["order_items", "orders", "products", "customers", "categories"]:
-            conn.execute(f"DROP TABLE IF EXISTS {t}")
-        conn.commit()
-        print("Dropped all tables.")
-    conn.executescript(SCHEMA_SQL)
-    conn.commit()
-    if not clear and conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0] > 0:
-        print("Already seeded. Use --clear to reseed.")
-        conn.close()
-        return
-    cat_ids = []
-    for name, slug, desc in CATEGORIES:
-        cur = conn.execute("INSERT INTO categories (name,slug,description) VALUES (?,?,?)", (name,slug,desc))
-        cat_ids.append(cur.lastrowid)
-    cust_ids = []
-    for name, email, phone, city, country, cc in CUSTOMERS:
-        cur = conn.execute("INSERT INTO customers (name,email,phone,city,country,country_code) VALUES (?,?,?,?,?,?)", (name,email,phone,city,country,cc))
-        cust_ids.append(cur.lastrowid)
-    prod_data = []
-    for name, sku, cat_idx, price, stock in PRODUCTS:
-        cur = conn.execute("INSERT INTO products (name,sku,category_id,price,stock_qty,active) VALUES (?,?,?,?,?,1)", (name,sku,cat_ids[cat_idx],price,stock))
-        prod_data.append({"id": cur.lastrowid, "price": price})
-    base = datetime.utcnow() - timedelta(days=90)
-    for _ in range(50):
-        cust_id = random.choice(cust_ids)
-        status  = random.choice(STATUSES)
-        created = (base + timedelta(days=random.randint(0, 90))).strftime("%Y-%m-%d %H:%M:%S")
-        cur = conn.execute("INSERT INTO orders (customer_id,status,currency,created_at,updated_at) VALUES (?,?,?,?,?)", (cust_id,status,"USD",created,created))
-        order_id = cur.lastrowid
-        total = 0.0
-        for _ in range(random.randint(1, 4)):
-            prod = random.choice(prod_data)
-            qty  = random.randint(1, 5)
-            sub  = round(prod["price"] * qty, 2)
-            total += sub
-            conn.execute("INSERT INTO order_items (order_id,product_id,quantity,unit_price,subtotal,created_at) VALUES (?,?,?,?,?,?)", (order_id,prod["id"],qty,prod["price"],sub,created))
-        conn.execute("UPDATE orders SET total_amount=? WHERE id=?", (round(total,2), order_id))
-    conn.commit()
-    conn.close()
-    print("Seeded: categories, customers, products, orders, order_items.")
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--clear", action="store_true")
-    args = parser.parse_args()
-    seed(clear=args.clear)
-
-
-# ============================================================
-# main.py
-# ============================================================
+  python main.py            # dev  (reads ENV from .env)
+  ENV=prod python main.py   # prod (downloads DB from S3 first)
+"""
 import logging
 from contextlib import asynccontextmanager
+
 import uvicorn
 from fastapi import FastAPI, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+
 from config import settings
-from database import DB_REGISTRY, get_connection
-from models import SCHEMA_SQL
+from database import DB_REGISTRY, download_db_from_s3, get_connection
 from routers import router
 
 logging.basicConfig(
@@ -513,14 +45,29 @@ log = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # ── Download DB from S3 (prod) ────────────────────────────────────────────
+    if settings.USE_S3:
+        if not settings.S3_BUCKET or not settings.S3_KEY:
+            raise RuntimeError(
+                "USE_S3=true but S3_BUCKET and/or S3_KEY are not set in .env"
+            )
+        download_db_from_s3(
+            bucket=settings.S3_BUCKET,
+            key=settings.S3_KEY,
+            dest_path=settings.DB_PATH,
+        )
+    else:
+        log.info("USE_S3=false — using local DB at %s", settings.DB_PATH)
+
+    # ── Verify every registered DB is reachable ───────────────────────────────
     for db_key, db_path in DB_REGISTRY.items():
         conn = get_connection(db_key)
         try:
-            conn.executescript(SCHEMA_SQL)
-            conn.commit()
-            log.info("DB '%s' (%s) ready.", db_key, db_path)
+            conn.execute("SELECT 1")
+            log.info("DB '%s' (%s) connected.", db_key, db_path)
         finally:
             conn.close()
+
     yield
     log.info("Shutting down.")
 
@@ -535,6 +82,7 @@ def create_app() -> FastAPI:
         openapi_url="/openapi.json",
         lifespan=lifespan,
     )
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.CORS_ORIGINS,
@@ -546,17 +94,113 @@ def create_app() -> FastAPI:
     @app.exception_handler(Exception)
     async def _unhandled(request: Request, exc: Exception):
         log.exception("Unhandled error: %s", exc)
-        return JSONResponse(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content={"detail": "Internal server error."})
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"detail": "Internal server error."},
+        )
 
     @app.get("/health", tags=["system"], summary="Health check")
     def health():
         return {"status": "ok", "env": settings.ENV, "version": settings.API_VERSION}
 
     app.include_router(router, prefix=settings.API_PREFIX)
+
+    log.info(
+        "Starting %s v%s [%s] on %s:%s",
+        settings.API_TITLE, settings.API_VERSION,
+        settings.ENV, settings.HOST, settings.PORT,
+    )
     return app
 
 
 app = create_app()
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host=settings.HOST, port=settings.PORT, reload=settings.is_dev, log_level="debug" if settings.is_dev else "info")
+    uvicorn.run(
+        "main:app",
+        host=settings.HOST,
+        port=settings.PORT,
+        reload=settings.is_dev,
+        log_level="debug" if settings.is_dev else "info",
+    )
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+pydantic==2.10.4
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
+boto3==1.35.0
+import logging
+import sqlite3
+from typing import Optional
+
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
+
+from config import settings
+
+log = logging.getLogger(__name__)
+
+
+# ── S3 download ───────────────────────────────────────────────────────────────
+
+def download_db_from_s3(
+    bucket: str,
+    key: str,
+    dest_path: str,
+    region: str = settings.AWS_REGION,
+    aws_access_key_id: Optional[str] = settings.AWS_ACCESS_KEY_ID,
+    aws_secret_access_key: Optional[str] = settings.AWS_SECRET_ACCESS_KEY,
+) -> None:
+    """
+    Download a SQLite file from S3 to dest_path.
+
+    Credentials are resolved in this order:
+      1. Explicit AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars.
+      2. IAM instance role (EC2 / ECS) — no keys needed.
+      3. ~/.aws/credentials profile (local dev with AWS CLI configured).
+    """
+    log.info("Downloading s3://%s/%s → %s", bucket, key, dest_path)
+
+    session_kwargs: dict = {"region_name": region}
+    if aws_access_key_id and aws_secret_access_key:
+        session_kwargs["aws_access_key_id"] = aws_access_key_id
+        session_kwargs["aws_secret_access_key"] = aws_secret_access_key
+
+    try:
+        s3 = boto3.client("s3", **session_kwargs)
+        s3.download_file(bucket, key, dest_path)
+        log.info("Download complete: %s", dest_path)
+    except ClientError as e:
+        code = e.response["Error"]["Code"]
+        raise RuntimeError(
+            f"S3 ClientError [{code}] downloading s3://{bucket}/{key}: {e}"
+        ) from e
+    except BotoCoreError as e:
+        raise RuntimeError(
+            f"BotoCoreError downloading s3://{bucket}/{key}: {e}"
+        ) from e
+
+
+# ── SQLite connection ─────────────────────────────────────────────────────────
+
+def _connect(path: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(path, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def get_connection(db_key: str = "default") -> sqlite3.Connection:
+    path = DB_REGISTRY[db_key]
+    return _connect(path)
+
+
+# ── Database registry ─────────────────────────────────────────────────────────
+# Maps a logical name → local file path (after any S3 download).
+
+DB_REGISTRY: dict[str, str] = {
+    "default": settings.DB_PATH,
+    # "analytics": settings.DB_PATH_ANALYTICS,
+}
+

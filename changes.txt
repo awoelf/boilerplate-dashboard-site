@@ -1,4 +1,4 @@
-# ============================================================
+0# ============================================================
 # .env.example  (copy to .env)
 # ============================================================
 VITE_API_ENDPOINT=http://your-ec2-ip:5000
@@ -843,3 +843,15 @@ export default {
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
+
+/// <reference types="vite/client" />
+
+interface ImportMetaEnv {
+  readonly VITE_API_ENDPOINT: string;
+  readonly VITE_API_KEY: string;
+  readonly VITE_LOGIN_PASSWORD: string;
+}
+
+interface ImportMeta {
+  readonly env: ImportMetaEnv;
+}

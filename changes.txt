@@ -48,3 +48,798 @@ const client = axios.create({
 });
 
 const AUTH_KEY = 'data_explorer_auth';
+
+export function saveAuth(): void {
+  sessionStorage.setItem(AUTH_KEY, 'true');
+}
+
+export function isAuthenticated(): boolean {
+  return sessionStorage.getItem(AUTH_KEY) === 'true';
+}
+
+export function clearAuth(): void {
+  sessionStorage.removeItem(AUTH_KEY);
+}
+
+export function checkLoginPassword(input: string): boolean {
+  const expected = import.meta.env.VITE_LOGIN_PASSWORD as string;
+  return input === expected;
+}
+
+export async function validateConnection(): Promise<void> {
+  await client.get('/health');
+  await client.get('/api/tables');
+}
+
+export async function fetchTables(): Promise<TableMeta[]> {
+  const { data } = await client.get<TableMeta[]>('/api/tables');
+  return data;
+}
+
+export async function fetchRows(
+  table: string,
+  params: Record<string, string | number>,
+): Promise<PagedResponse> {
+  const { data } = await client.get<PagedResponse>(`/api/${table}`, { params });
+  return data;
+}
+
+export async function searchRows(
+  table: string,
+  params: Record<string, string | number>,
+): Promise<PagedResponse> {
+  const { data } = await client.get<PagedResponse>(`/api/${table}/search`, { params });
+  return data;
+}
+
+export async function fetchAllRows(
+  table: string,
+  searchTerm?: string,
+): Promise<Record<string, unknown>[]> {
+  const MAX = 1000;
+  const params: Record<string, string | number> = { page: 1, page_size: MAX };
+  if (searchTerm) params.q = searchTerm;
+  const fn = searchTerm ? searchRows : fetchRows;
+  const first = await fn(table, params);
+  const items = [...first.items];
+  if (first.pages > 1) {
+    const rest = await Promise.all(
+      Array.from({ length: first.pages - 1 }, (_, i) =>
+        fn(table, { ...params, page: i + 2 }),
+      ),
+    );
+    rest.forEach((r) => items.push(...r.items));
+  }
+  return items;
+}
+
+
+# ============================================================
+# src/api/export.ts
+# ============================================================
+import * as XLSX from 'xlsx';
+
+export function exportToXlsx(
+  rows: Record<string, unknown>[],
+  tableName: string,
+): void {
+  if (rows.length === 0) return;
+  const ws = XLSX.utils.json_to_sheet(rows);
+  const cols = Object.keys(rows[0]);
+  ws['!cols'] = cols.map((key) => {
+    const maxLen = Math.max(
+      key.length,
+      ...rows.slice(0, 200).map((r) => String(r[key] ?? '').length),
+    );
+    return { wch: Math.min(maxLen + 2, 50) };
+  });
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, tableName.slice(0, 31));
+  const filename = `${tableName}_${new Date().toISOString().slice(0, 10)}.xlsx`;
+  XLSX.writeFile(wb, filename);
+}
+
+
+# ============================================================
+# src/hooks/useTheme.ts
+# ============================================================
+import { useEffect, useState } from 'react';
+import { Theme } from '@/types';
+
+const THEME_KEY = 'data_api_theme';
+
+function getInitialTheme(): Theme {
+  const stored = localStorage.getItem(THEME_KEY) as Theme | null;
+  if (stored === 'dark' || stored === 'light') return stored;
+  return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+}
+
+export function useTheme() {
+  const [theme, setTheme] = useState<Theme>(getInitialTheme);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    if (theme === 'dark') {
+      root.classList.add('dark');
+    } else {
+      root.classList.remove('dark');
+    }
+    localStorage.setItem(THEME_KEY, theme);
+  }, [theme]);
+
+  const toggle = () => setTheme((t) => (t === 'dark' ? 'light' : 'dark'));
+  return { theme, toggle };
+}
+
+
+# ============================================================
+# src/App.tsx
+# ============================================================
+import { useState } from 'react';
+import { clearAuth, isAuthenticated } from '@/api/client';
+import Login from '@/pages/Login';
+import Dashboard from '@/pages/Dashboard';
+
+export default function App() {
+  const [authed, setAuthed] = useState<boolean>(() => isAuthenticated());
+
+  function handleLogout() {
+    clearAuth();
+    setAuthed(false);
+  }
+
+  if (!authed) {
+    return <Login onSuccess={() => setAuthed(true)} />;
+  }
+
+  return <Dashboard onLogout={handleLogout} />;
+}
+
+
+# ============================================================
+# src/main.tsx
+# ============================================================
+import { StrictMode } from 'react'
+import { createRoot } from 'react-dom/client'
+import './index.css'
+import App from './App.tsx'
+
+createRoot(document.getElementById('root')!).render(
+  <StrictMode>
+    <App />
+  </StrictMode>,
+)
+
+
+# ============================================================
+# src/index.css
+# ============================================================
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { @apply bg-gray-200 dark:bg-gray-700 rounded-full; }
+  ::-webkit-scrollbar-thumb:hover { @apply bg-gray-300 dark:bg-gray-600; }
+}
+
+
+# ============================================================
+# src/pages/Login.tsx
+# ============================================================
+import { useState } from 'react';
+import { Database, KeyRound, Loader2, Moon, Sun } from 'lucide-react';
+import { checkLoginPassword, saveAuth, validateConnection } from '@/api/client';
+import { useTheme } from '@/hooks/useTheme';
+
+interface LoginProps {
+  onSuccess: () => void;
+}
+
+export default function Login({ onSuccess }: LoginProps) {
+  const { theme, toggle } = useTheme();
+  const [password, setPassword] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+
+  async function handleConnect(e: React.FormEvent) {
+    e.preventDefault();
+    setError('');
+    if (!password.trim()) { setError('Password is required.'); return; }
+    if (!checkLoginPassword(password)) { setError('Incorrect password.'); return; }
+    setLoading(true);
+    try {
+      await validateConnection();
+      saveAuth();
+      onSuccess();
+    } catch {
+      setError('Could not reach the API. Check your network or contact your administrator.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-50 dark:bg-gray-950 flex items-center justify-center p-4">
+      <button
+        onClick={toggle}
+        aria-label="Toggle theme"
+        className="fixed top-4 right-4 p-2 rounded-lg text-gray-500 dark:text-gray-400
+                   hover:bg-gray-200 dark:hover:bg-gray-800 transition-colors"
+      >
+        {theme === 'dark' ? <Sun size={18} /> : <Moon size={18} />}
+      </button>
+
+      <div className="w-full max-w-md">
+        <div className="text-center mb-8">
+          <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl
+                          bg-brand-600 mb-4 shadow-lg shadow-brand-600/30">
+            <Database size={28} className="text-white" />
+          </div>
+          <h1 className="text-2xl font-semibold text-gray-900 dark:text-white tracking-tight">
+            Data API Explorer
+          </h1>
+          <p className="mt-1 text-sm text-gray-500 dark:text-gray-400">
+            Enter your password to continue
+          </p>
+        </div>
+
+        <div className="bg-white dark:bg-gray-900 rounded-2xl shadow-xl shadow-gray-200/60
+                        dark:shadow-black/40 border border-gray-100 dark:border-gray-800 p-8">
+          <form onSubmit={handleConnect} className="space-y-5">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1.5">
+                Password
+              </label>
+              <div className="relative">
+                <KeyRound size={15} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-gray-400 dark:text-gray-500" />
+                <input
+                  type="password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  placeholder="••••••••"
+                  autoComplete="current-password"
+                  autoFocus
+                  className="w-full pl-10 pr-3.5 py-2.5 rounded-lg border border-gray-200 dark:border-gray-700
+                             bg-gray-50 dark:bg-gray-800 text-gray-900 dark:text-white
+                             placeholder-gray-400 dark:placeholder-gray-500 text-sm
+                             focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent
+                             transition-shadow"
+                />
+              </div>
+            </div>
+
+            {error && (
+              <p className="text-sm text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-950/40
+                            border border-red-200 dark:border-red-800 rounded-lg px-3.5 py-2.5">
+                {error}
+              </p>
+            )}
+
+            <button
+              type="submit"
+              disabled={loading}
+              className="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg
+                         bg-brand-600 hover:bg-brand-700 active:bg-brand-800
+                         text-white text-sm font-medium
+                         focus:outline-none focus:ring-2 focus:ring-brand-500 focus:ring-offset-2
+                         dark:focus:ring-offset-gray-900
+                         disabled:opacity-60 disabled:cursor-not-allowed transition-colors"
+            >
+              {loading ? (<><Loader2 size={15} className="animate-spin" />Connecting…</>) : 'Sign in'}
+            </button>
+          </form>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+
+# ============================================================
+# src/pages/Dashboard.tsx
+# ============================================================
+import { useEffect, useState } from 'react';
+import { AlertCircle, Loader2, Moon, RefreshCw, Sun } from 'lucide-react';
+import { fetchTables } from '@/api/client';
+import Sidebar from '@/components/Sidebar';
+import TableView from '@/components/TableView';
+import { useTheme } from '@/hooks/useTheme';
+import { TableMeta } from '@/types';
+
+interface DashboardProps {
+  onLogout: () => void;
+}
+
+export default function Dashboard({ onLogout }: DashboardProps) {
+  const { theme, toggle } = useTheme();
+  const [tables, setTables] = useState<TableMeta[]>([]);
+  const [selectedTable, setSelectedTable] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  async function loadTables() {
+    setLoading(true);
+    setError('');
+    try {
+      const data = await fetchTables();
+      setTables(data);
+      if (data.length > 0 && !selectedTable) setSelectedTable(data[0].name);
+    } catch {
+      setError('Failed to load tables. The API may be unavailable.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => { loadTables(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const currentTable = tables.find((t) => t.name === selectedTable) ?? null;
+
+  return (
+    <div className="flex h-screen bg-gray-50 dark:bg-gray-950 overflow-hidden">
+      <Sidebar
+        tables={tables}
+        selectedTable={selectedTable}
+        onSelectTable={setSelectedTable}
+        onLogout={onLogout}
+        endpoint={import.meta.env.VITE_API_ENDPOINT}
+      />
+      <main className="flex-1 flex flex-col overflow-hidden bg-white dark:bg-gray-950">
+        <div className="flex items-center justify-end gap-2 px-5 py-3
+                        border-b border-gray-100 dark:border-gray-800 shrink-0">
+          <button onClick={loadTables} disabled={loading} aria-label="Refresh"
+            className="p-2 rounded-lg text-gray-400 dark:text-gray-600
+                       hover:bg-gray-100 dark:hover:bg-gray-800 hover:text-gray-700 dark:hover:text-gray-300
+                       disabled:opacity-40 transition-colors">
+            <RefreshCw size={15} className={loading ? 'animate-spin' : ''} />
+          </button>
+          <button onClick={toggle} aria-label="Toggle theme"
+            className="p-2 rounded-lg text-gray-400 dark:text-gray-600
+                       hover:bg-gray-100 dark:hover:bg-gray-800 hover:text-gray-700 dark:hover:text-gray-300
+                       transition-colors">
+            {theme === 'dark' ? <Sun size={15} /> : <Moon size={15} />}
+          </button>
+        </div>
+        <div className="flex-1 overflow-hidden">
+          {loading && tables.length === 0 ? (
+            <div className="flex items-center justify-center h-full gap-2 text-gray-400 dark:text-gray-600">
+              <Loader2 size={20} className="animate-spin" /><span className="text-sm">Loading tables…</span>
+            </div>
+          ) : error ? (
+            <div className="flex flex-col items-center justify-center h-full gap-3 text-center p-8">
+              <AlertCircle size={32} className="text-red-400" />
+              <p className="text-sm text-red-600 dark:text-red-400 max-w-sm">{error}</p>
+              <button onClick={loadTables} className="text-sm text-brand-600 dark:text-brand-400 hover:underline">Try again</button>
+            </div>
+          ) : tables.length === 0 ? (
+            <div className="flex items-center justify-center h-full text-sm text-gray-400 dark:text-gray-600">No tables found.</div>
+          ) : currentTable ? (
+            <TableView table={currentTable} />
+          ) : (
+            <div className="flex items-center justify-center h-full text-sm text-gray-400 dark:text-gray-600">Select a table from the sidebar.</div>
+          )}
+        </div>
+      </main>
+    </div>
+  );
+}
+
+
+# ============================================================
+# src/components/Sidebar.tsx
+# ============================================================
+import { Database, LogOut, Table2 } from 'lucide-react';
+import { TableMeta } from '@/types';
+
+interface SidebarProps {
+  tables: TableMeta[];
+  selectedTable: string | null;
+  onSelectTable: (name: string) => void;
+  onLogout: () => void;
+  endpoint: string;
+}
+
+export default function Sidebar({ tables, selectedTable, onSelectTable, onLogout, endpoint }: SidebarProps) {
+  const byDb = tables.reduce<Record<string, TableMeta[]>>((acc, t) => {
+    (acc[t.db] ??= []).push(t);
+    return acc;
+  }, {});
+
+  return (
+    <aside className="flex flex-col w-60 shrink-0 bg-white dark:bg-gray-900
+                      border-r border-gray-100 dark:border-gray-800 h-screen sticky top-0">
+      <div className="px-4 pt-5 pb-4 border-b border-gray-100 dark:border-gray-800">
+        <div className="flex items-center gap-2.5 mb-1">
+          <div className="flex items-center justify-center w-7 h-7 rounded-md bg-brand-600">
+            <Database size={14} className="text-white" />
+          </div>
+          <span className="text-sm font-semibold text-gray-900 dark:text-white tracking-tight">API Explorer</span>
+        </div>
+        <p className="text-[10px] text-gray-400 dark:text-gray-600 font-mono truncate pl-0.5" title={endpoint}>
+          {endpoint.replace(/^https?:\/\//, '')}
+        </p>
+      </div>
+
+      <nav className="flex-1 overflow-y-auto px-2 py-3 space-y-4">
+        {Object.entries(byDb).map(([db, dbTables]) => (
+          <div key={db}>
+            <p className="px-2 mb-1 text-[10px] font-semibold uppercase tracking-widest text-gray-400 dark:text-gray-600">{db}</p>
+            <ul className="space-y-0.5">
+              {dbTables.map((t) => {
+                const active = t.name === selectedTable;
+                return (
+                  <li key={t.name}>
+                    <button onClick={() => onSelectTable(t.name)}
+                      className={`w-full flex items-center gap-2.5 px-2.5 py-2 rounded-lg text-sm transition-colors group text-left
+                                  ${active ? 'bg-brand-50 dark:bg-brand-900/30 text-brand-700 dark:text-brand-300'
+                                           : 'text-gray-600 dark:text-gray-400 hover:bg-gray-50 dark:hover:bg-gray-800 hover:text-gray-900 dark:hover:text-white'}`}>
+                      <Table2 size={14} className={active ? 'text-brand-600 dark:text-brand-400' : 'text-gray-400 dark:text-gray-600 group-hover:text-gray-500'} />
+                      <span className="flex-1 truncate font-medium">{t.name}</span>
+                      <span className={`text-[10px] font-mono tabular-nums ${active ? 'text-brand-500 dark:text-brand-400' : 'text-gray-300 dark:text-gray-700'}`}>
+                        {t.row_count.toLocaleString()}
+                      </span>
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        ))}
+      </nav>
+
+      <div className="px-3 py-3 border-t border-gray-100 dark:border-gray-800">
+        <button onClick={onLogout}
+          className="w-full flex items-center gap-2 px-3 py-2 rounded-lg text-sm
+                     text-gray-500 dark:text-gray-400 hover:bg-red-50 dark:hover:bg-red-950/40
+                     hover:text-red-600 dark:hover:text-red-400 transition-colors">
+          <LogOut size={14} />Disconnect
+        </button>
+      </div>
+    </aside>
+  );
+}
+
+
+# ============================================================
+# src/components/TableView.tsx
+# ============================================================
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Download, Loader2, Search, X } from 'lucide-react';
+import { fetchAllRows, fetchRows, searchRows } from '@/api/client';
+import { exportToXlsx } from '@/api/export';
+import { PagedResponse, TableMeta } from '@/types';
+
+interface TableViewProps {
+  table: TableMeta;
+}
+
+const PAGE_SIZE = 50;
+const DEBOUNCE_MS = 350;
+
+export default function TableView({ table }: TableViewProps) {
+  const [data, setData] = useState<PagedResponse | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [exporting, setExporting] = useState(false);
+  const [error, setError] = useState('');
+  const [searchTerm, setSearchTerm] = useState('');
+  const [page, setPage] = useState(1);
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const load = useCallback(async (term: string, pg: number) => {
+    setLoading(true);
+    setError('');
+    try {
+      const params = { page: pg, page_size: PAGE_SIZE, ...(term ? { q: term } : {}) };
+      const result = term ? await searchRows(table.name, params) : await fetchRows(table.name, params);
+      setData(result);
+    } catch (e: unknown) {
+      setError((e as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? 'Failed to load data.');
+    } finally {
+      setLoading(false);
+    }
+  }, [table.name]);
+
+  useEffect(() => { setSearchTerm(''); setPage(1); setData(null); load('', 1); }, [table.name]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  useEffect(() => {
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    debounceRef.current = setTimeout(() => { setPage(1); load(searchTerm, 1); }, DEBOUNCE_MS);
+    return () => { if (debounceRef.current) clearTimeout(debounceRef.current); };
+  }, [searchTerm]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  function handlePageChange(pg: number) { setPage(pg); load(searchTerm, pg); }
+
+  async function handleExport() {
+    setExporting(true);
+    try {
+      const rows = await fetchAllRows(table.name, searchTerm || undefined);
+      exportToXlsx(rows, table.name);
+    } catch { setError('Export failed.'); }
+    finally { setExporting(false); }
+  }
+
+  const columns = data?.items[0] ? Object.keys(data.items[0]) : table.columns;
+  const hasSearch = table.searchable_columns.length > 0;
+
+  return (
+    <div className="flex flex-col h-full">
+      <div className="flex items-center gap-3 px-6 py-4 border-b border-gray-100 dark:border-gray-800 shrink-0">
+        <div className="flex-1">
+          <h2 className="text-base font-semibold text-gray-900 dark:text-white tracking-tight">{table.name}</h2>
+          <p className="text-xs text-gray-400 dark:text-gray-600 font-mono mt-0.5">
+            {data ? <>{data.total.toLocaleString()} rows{data.total !== table.row_count && searchTerm ? ` matching "${searchTerm}"` : ''}</> : `${table.row_count.toLocaleString()} rows`}
+          </p>
+        </div>
+
+        {hasSearch && (
+          <div className="relative w-64">
+            <Search size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 dark:text-gray-600 pointer-events-none" />
+            <input type="search" value={searchTerm} onChange={(e) => setSearchTerm(e.target.value)}
+              placeholder={`Search ${table.searchable_columns.join(', ')}…`}
+              className="w-full pl-8 pr-8 py-2 text-sm rounded-lg border border-gray-200 dark:border-gray-700
+                         bg-gray-50 dark:bg-gray-800 text-gray-900 dark:text-white
+                         placeholder-gray-400 dark:placeholder-gray-600
+                         focus:outline-none focus:ring-2 focus:ring-brand-500 focus:border-transparent transition-shadow" />
+            {searchTerm && (
+              <button onClick={() => setSearchTerm('')} className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600 dark:hover:text-gray-300">
+                <X size={13} />
+              </button>
+            )}
+          </div>
+        )}
+
+        <button onClick={handleExport} disabled={exporting || loading || !data?.items.length}
+          className="flex items-center gap-1.5 px-3 py-2 text-sm font-medium rounded-lg
+                     border border-gray-200 dark:border-gray-700 text-gray-600 dark:text-gray-400
+                     hover:bg-gray-50 dark:hover:bg-gray-800 hover:text-gray-900 dark:hover:text-white
+                     disabled:opacity-40 disabled:cursor-not-allowed transition-colors">
+          {exporting ? <Loader2 size={14} className="animate-spin" /> : <Download size={14} />}
+          Export .xlsx
+        </button>
+      </div>
+
+      {error && (
+        <div className="mx-6 mt-4 px-4 py-3 rounded-lg bg-red-50 dark:bg-red-950/40
+                        border border-red-200 dark:border-red-800 text-sm text-red-600 dark:text-red-400">
+          {error}
+        </div>
+      )}
+
+      <div className="flex-1 overflow-auto px-6 py-4">
+        {loading && !data ? (
+          <div className="flex items-center justify-center h-40 gap-2 text-gray-400 dark:text-gray-600">
+            <Loader2 size={18} className="animate-spin" /><span className="text-sm">Loading…</span>
+          </div>
+        ) : data?.items.length === 0 ? (
+          <div className="flex items-center justify-center h-40 text-sm text-gray-400 dark:text-gray-600">
+            No results{searchTerm ? ` for "${searchTerm}"` : ''}.
+          </div>
+        ) : (
+          <div className="relative rounded-xl border border-gray-100 dark:border-gray-800 overflow-hidden shadow-sm">
+            {loading && (
+              <div className="absolute inset-0 bg-white/60 dark:bg-gray-950/60 z-10 flex items-center justify-center">
+                <Loader2 size={20} className="animate-spin text-brand-500" />
+              </div>
+            )}
+            <table className="w-full text-sm border-collapse">
+              <thead>
+                <tr className="bg-gray-50 dark:bg-gray-800/60">
+                  {columns.map((col) => (
+                    <th key={col} className="text-left px-4 py-3 text-xs font-semibold text-gray-500 dark:text-gray-400
+                                             uppercase tracking-wider whitespace-nowrap border-b border-gray-100 dark:border-gray-800 font-mono">
+                      {col}
+                    </th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {(data?.items ?? []).map((row, i) => (
+                  <tr key={i} className="border-b border-gray-50 dark:border-gray-800/60 hover:bg-brand-50/50 dark:hover:bg-brand-900/10 transition-colors">
+                    {columns.map((col) => {
+                      const val = (row as Record<string, unknown>)[col];
+                      return (
+                        <td key={col} className="px-4 py-2.5 text-gray-700 dark:text-gray-300 whitespace-nowrap max-w-xs">
+                          <span className="block truncate">
+                            {val === null || val === undefined ? (
+                              <span className="text-gray-300 dark:text-gray-700 font-mono text-xs">null</span>
+                            ) : typeof val === 'boolean' ? (
+                              <span className={`inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium ${val ? 'bg-green-50 text-green-700 dark:bg-green-900/30 dark:text-green-400' : 'bg-red-50 text-red-600 dark:bg-red-900/30 dark:text-red-400'}`}>
+                                {val ? 'true' : 'false'}
+                              </span>
+                            ) : typeof val === 'number' ? (
+                              <span className="font-mono text-brand-600 dark:text-brand-400">{val.toLocaleString()}</span>
+                            ) : String(val).match(/^\d{4}-\d{2}-\d{2}/) ? (
+                              <span className="text-gray-500 dark:text-gray-500 font-mono text-xs">{String(val).slice(0, 19).replace('T', ' ')}</span>
+                            ) : (
+                              String(val)
+                            )}
+                          </span>
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {data && data.pages > 1 && (
+        <div className="flex items-center justify-between px-6 py-3 border-t border-gray-100 dark:border-gray-800 shrink-0">
+          <span className="text-xs text-gray-400 dark:text-gray-600">Page {data.page} of {data.pages} — {data.total.toLocaleString()} rows</span>
+          <div className="flex items-center gap-1">
+            <PagBtn onClick={() => handlePageChange(1)} disabled={page === 1} label="First"><ChevronsLeft size={14} /></PagBtn>
+            <PagBtn onClick={() => handlePageChange(page - 1)} disabled={page === 1} label="Prev"><ChevronLeft size={14} /></PagBtn>
+            <span className="px-3 py-1 text-xs font-mono text-gray-600 dark:text-gray-400">{page}</span>
+            <PagBtn onClick={() => handlePageChange(page + 1)} disabled={page >= data.pages} label="Next"><ChevronRight size={14} /></PagBtn>
+            <PagBtn onClick={() => handlePageChange(data.pages)} disabled={page >= data.pages} label="Last"><ChevronsRight size={14} /></PagBtn>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function PagBtn({ children, onClick, disabled, label }: { children: React.ReactNode; onClick: () => void; disabled: boolean; label: string; }) {
+  return (
+    <button onClick={onClick} disabled={disabled} aria-label={label}
+      className="p-1.5 rounded text-gray-400 dark:text-gray-600
+                 hover:bg-gray-100 dark:hover:bg-gray-800 hover:text-gray-700 dark:hover:text-gray-300
+                 disabled:opacity-30 disabled:cursor-not-allowed transition-colors">
+      {children}
+    </button>
+  );
+}
+
+
+# ============================================================
+# package.json
+# ============================================================
+{
+  "name": "data-api-frontend",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --port 8080",
+    "build": "tsc && vite build",
+    "preview": "vite preview --port 8080"
+  },
+  "dependencies": {
+    "axios": "^1.7.9",
+    "lucide-react": "^0.469.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.17",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5"
+  }
+}
+
+
+# ============================================================
+# vite.config.ts
+# ============================================================
+import { defineConfig } from 'vite'
+import react from '@vitejs/plugin-react'
+import path from 'path'
+
+export default defineConfig({
+  plugins: [react()],
+  resolve: { alias: { '@': path.resolve(__dirname, './src') } },
+  server: { port: 8080, strictPort: true },
+  preview: { port: 8080, strictPort: true },
+})
+
+
+# ============================================================
+# tailwind.config.js
+# ============================================================
+export default {
+  darkMode: 'class',
+  content: ['./index.html', './src/**/*.{ts,tsx}'],
+  theme: {
+    extend: {
+      fontFamily: {
+        sans: ['Inter', 'system-ui', 'sans-serif'],
+        mono: ['JetBrains Mono', 'Menlo', 'monospace'],
+      },
+      colors: {
+        brand: {
+          50: '#eef2ff', 100: '#e0e7ff', 200: '#c7d2fe',
+          400: '#818cf8', 500: '#6366f1', 600: '#4f46e5',
+          700: '#4338ca', 800: '#3730a3', 900: '#312e81',
+        },
+      },
+    },
+  },
+  plugins: [],
+}
+
+
+# ============================================================
+# postcss.config.js
+# ============================================================
+export default {
+  plugins: { tailwindcss: {}, autoprefixer: {} },
+}
+
+
+# ============================================================
+# tsconfig.json
+# ============================================================
+{
+  "compilerOptions": {
+    "target": "ES2020",
+    "useDefineForClassFields": true,
+    "lib": ["ES2020", "DOM", "DOM.Iterable"],
+    "module": "ESNext",
+    "skipLibCheck": true,
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true,
+    "baseUrl": ".",
+    "paths": { "@/*": ["./src/*"] }
+  },
+  "include": ["src"],
+  "references": [{ "path": "./tsconfig.node.json" }]
+}
+
+
+# ============================================================
+# tsconfig.node.json
+# ============================================================
+{
+  "compilerOptions": {
+    "composite": true,
+    "skipLibCheck": true,
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "allowSyntheticDefaultImports": true
+  },
+  "include": ["vite.config.ts"]
+}
+
+
+# ============================================================
+# index.html
+# ============================================================
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Data API Explorer</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

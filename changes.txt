@@ -1,206 +1,50 @@
-"""
-Database layer using Python's built-in sqlite3 + boto3 for AWS S3.
-
-How it works
-────────────
-Dev  (USE_S3=false): connects directly to the local DB_PATH file.
-Prod (USE_S3=true):  downloads the .db file from S3 into DB_PATH on
-                     startup, then connects to that local copy.
-                     The file is re-downloaded each time the server starts,
-                     so deployments always get the latest snapshot from S3.
-
-Adding a second database
-─────────────────────────
-1. Add S3_BUCKET_<NAME> / S3_KEY_<NAME> / DB_PATH_<NAME> vars to config.py.
-2. Call download_db_from_s3() for it in main.py lifespan.
-3. Register it in DB_REGISTRY below.
-4. Reference it via "db" in registry.py.
-"""
+# ============================================================
+# .env.example  (copy to .env)
+# ============================================================
+VITE_API_ENDPOINT=http://your-ec2-ip:5000
+VITE_API_KEY=changeme
+VITE_LOGIN_PASSWORD=myloginpassword
 
 
-"""
-Entry point.
-
-  python main.py            # dev  (reads ENV from .env)
-  ENV=prod python main.py   # prod (downloads DB from S3 first)
-"""
-import logging
-from contextlib import asynccontextmanager
-
-import uvicorn
-from fastapi import FastAPI, Request, status
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-
-from config import settings
-from database import DB_REGISTRY, download_db_from_s3, get_connection
-from routers import router
-
-logging.basicConfig(
-    level=logging.DEBUG if settings.is_dev else logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s – %(message)s",
-)
-log = logging.getLogger(__name__)
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # ── Download DB from S3 (prod) ────────────────────────────────────────────
-    if settings.USE_S3:
-        if not settings.S3_BUCKET or not settings.S3_KEY:
-            raise RuntimeError(
-                "USE_S3=true but S3_BUCKET and/or S3_KEY are not set in .env"
-            )
-        download_db_from_s3(
-            bucket=settings.S3_BUCKET,
-            key=settings.S3_KEY,
-            dest_path=settings.DB_PATH,
-        )
-    else:
-        log.info("USE_S3=false — using local DB at %s", settings.DB_PATH)
-
-    # ── Verify every registered DB is reachable ───────────────────────────────
-    for db_key, db_path in DB_REGISTRY.items():
-        conn = get_connection(db_key)
-        try:
-            conn.execute("SELECT 1")
-            log.info("DB '%s' (%s) connected.", db_key, db_path)
-        finally:
-            conn.close()
-
-    yield
-    log.info("Shutting down.")
-
-
-def create_app() -> FastAPI:
-    app = FastAPI(
-        title=settings.API_TITLE,
-        description=settings.API_DESCRIPTION,
-        version=settings.API_VERSION,
-        docs_url="/docs" if settings.SHOW_DOCS else None,
-        redoc_url="/redoc" if settings.SHOW_DOCS else None,
-        openapi_url="/openapi.json",
-        lifespan=lifespan,
-    )
-
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=settings.CORS_ORIGINS,
-        allow_credentials=True,
-        allow_methods=["GET", "OPTIONS"],
-        allow_headers=["*"],
-    )
-
-    @app.exception_handler(Exception)
-    async def _unhandled(request: Request, exc: Exception):
-        log.exception("Unhandled error: %s", exc)
-        return JSONResponse(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            content={"detail": "Internal server error."},
-        )
-
-    @app.get("/health", tags=["system"], summary="Health check")
-    def health():
-        return {"status": "ok", "env": settings.ENV, "version": settings.API_VERSION}
-
-    app.include_router(router, prefix=settings.API_PREFIX)
-
-    log.info(
-        "Starting %s v%s [%s] on %s:%s",
-        settings.API_TITLE, settings.API_VERSION,
-        settings.ENV, settings.HOST, settings.PORT,
-    )
-    return app
-
-
-app = create_app()
-
-if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host=settings.HOST,
-        port=settings.PORT,
-        reload=settings.is_dev,
-        log_level="debug" if settings.is_dev else "info",
-    )
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-pydantic==2.10.4
-pydantic-settings==2.7.0
-python-dotenv==1.0.1
-boto3==1.35.0
-import logging
-import sqlite3
-from typing import Optional
-
-import boto3
-from botocore.exceptions import BotoCoreError, ClientError
-
-from config import settings
-
-log = logging.getLogger(__name__)
-
-
-# ── S3 download ───────────────────────────────────────────────────────────────
-
-def download_db_from_s3(
-    bucket: str,
-    key: str,
-    dest_path: str,
-    region: str = settings.AWS_REGION,
-    aws_access_key_id: Optional[str] = settings.AWS_ACCESS_KEY_ID,
-    aws_secret_access_key: Optional[str] = settings.AWS_SECRET_ACCESS_KEY,
-) -> None:
-    """
-    Download a SQLite file from S3 to dest_path.
-
-    Credentials are resolved in this order:
-      1. Explicit AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY env vars.
-      2. IAM instance role (EC2 / ECS) — no keys needed.
-      3. ~/.aws/credentials profile (local dev with AWS CLI configured).
-    """
-    log.info("Downloading s3://%s/%s → %s", bucket, key, dest_path)
-
-    session_kwargs: dict = {"region_name": region}
-    if aws_access_key_id and aws_secret_access_key:
-        session_kwargs["aws_access_key_id"] = aws_access_key_id
-        session_kwargs["aws_secret_access_key"] = aws_secret_access_key
-
-    try:
-        s3 = boto3.client("s3", **session_kwargs)
-        s3.download_file(bucket, key, dest_path)
-        log.info("Download complete: %s", dest_path)
-    except ClientError as e:
-        code = e.response["Error"]["Code"]
-        raise RuntimeError(
-            f"S3 ClientError [{code}] downloading s3://{bucket}/{key}: {e}"
-        ) from e
-    except BotoCoreError as e:
-        raise RuntimeError(
-            f"BotoCoreError downloading s3://{bucket}/{key}: {e}"
-        ) from e
-
-
-# ── SQLite connection ─────────────────────────────────────────────────────────
-
-def _connect(path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(path, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
-    return conn
-
-
-def get_connection(db_key: str = "default") -> sqlite3.Connection:
-    path = DB_REGISTRY[db_key]
-    return _connect(path)
-
-
-# ── Database registry ─────────────────────────────────────────────────────────
-# Maps a logical name → local file path (after any S3 download).
-
-DB_REGISTRY: dict[str, str] = {
-    "default": settings.DB_PATH,
-    # "analytics": settings.DB_PATH_ANALYTICS,
+# ============================================================
+# src/types.ts
+# ============================================================
+export interface TableMeta {
+  name: string;
+  db: string;
+  row_count: number;
+  columns: string[];
+  searchable_columns: string[];
 }
 
+export interface PagedResponse<T = Record<string, unknown>> {
+  total: number;
+  page: number;
+  page_size: number;
+  pages: number;
+  items: T[];
+}
+
+export type Theme = 'light' | 'dark';
+
+
+# ============================================================
+# src/api/client.ts
+# ============================================================
+import axios from 'axios';
+import { PagedResponse, TableMeta } from '@/types';
+
+const API_ENDPOINT = import.meta.env.VITE_API_ENDPOINT as string;
+const API_KEY      = import.meta.env.VITE_API_KEY as string;
+
+if (!API_ENDPOINT || !API_KEY) {
+  console.error('Missing VITE_API_ENDPOINT or VITE_API_KEY in .env');
+}
+
+const client = axios.create({
+  baseURL: API_ENDPOINT.replace(/\/$/, ''),
+  headers: { 'X-API-Key': API_KEY },
+  timeout: 15_000,
+});
+
+const AUTH_KEY = 'data_explorer_auth';
